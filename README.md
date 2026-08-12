@@ -1,5 +1,13 @@
 # Jira2Zammad
 
+[![jira](https://img.shields.io/badge/topic-jira-0052CC)](https://github.com/topics/jira)
+[![zammad](https://img.shields.io/badge/topic-zammad-1973B8)](https://github.com/topics/zammad)
+[![migration](https://img.shields.io/badge/topic-migration-6f42c1)](https://github.com/topics/migration)
+[![helpdesk](https://img.shields.io/badge/topic-helpdesk-2e7d32)](https://github.com/topics/helpdesk)
+[![ticketing](https://img.shields.io/badge/topic-ticketing-2e7d32)](https://github.com/topics/ticketing)
+[![service-desk](https://img.shields.io/badge/topic-service--desk-2e7d32)](https://github.com/topics/service-desk)
+[![python](https://img.shields.io/badge/topic-python-3776AB)](https://github.com/topics/python)
+
 Migrates a Jira Service Desk project into [Zammad](https://zammad.org/), preserving
 tickets, comments, attachments, assignees, reporters, and original timestamps.
 
