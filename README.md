@@ -40,6 +40,7 @@ Required environment variables (see `.env.example`):
 | `JIRA_EMAIL` | Jira account email (or username, for Jira Server) |
 | `JIRA_API_TOKEN` | Jira API token / password |
 | `JIRA_PROJECT_KEY` | The project to migrate, e.g. `PROJ` |
+| `JIRA_AUTH_TYPE` | `basic` (default; email/username + token) or `bearer` (Jira Server/Data Center Personal Access Token; `JIRA_EMAIL` not needed) |
 | `ZAMMAD_BASE_URL` | e.g. `https://zammad.example.com` |
 | `ZAMMAD_API_TOKEN` | Zammad API token — the token's user needs admin rights (see below) |
 | `ZAMMAD_GROUP` | Zammad group new tickets are created in (default: `Users`) |

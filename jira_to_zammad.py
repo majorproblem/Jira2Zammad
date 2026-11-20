@@ -29,6 +29,7 @@ JIRA_BASE_URL    = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL       = os.environ.get("JIRA_EMAIL", "")       # Jira Server username (not necessarily an email)
 JIRA_API_TOKEN   = os.environ.get("JIRA_API_TOKEN", "")   # Jira Server password (or Personal Access Token if enabled)
 JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "")
+JIRA_AUTH_TYPE   = os.environ.get("JIRA_AUTH_TYPE", "basic").lower()   # "basic" (email/username + token) or "bearer" (Server/DC Personal Access Token)
 
 ZAMMAD_BASE_URL  = os.environ.get("ZAMMAD_BASE_URL", "")
 ZAMMAD_API_TOKEN = os.environ.get("ZAMMAD_API_TOKEN", "")
@@ -47,6 +48,8 @@ _REQUIRED = [
 
 def validate_config():
     missing = [name for name in _REQUIRED if not globals()[name]]
+    if JIRA_AUTH_TYPE == "bearer" and "JIRA_EMAIL" in missing:
+        missing.remove("JIRA_EMAIL")   # PATs don't need a username
     if missing:
         logger.error(f"missing required configuration: {', '.join(missing)}")
         logger.error("Copy .env.example to .env and fill in your values, or export them as environment variables.")
@@ -126,9 +129,12 @@ def with_retries(max_retries=3, backoff_base=2.0):
     return decorator
 
 def jira_headers():
-    token = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    if JIRA_AUTH_TYPE == "bearer":
+        auth = f"Bearer {JIRA_API_TOKEN}"
+    else:
+        auth = "Basic " + base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
     return {
-        "Authorization": f"Basic {token}",
+        "Authorization": auth,
         "Accept": "application/json",
     }
 
@@ -153,8 +159,12 @@ def jira_raw_get(url):
 
 @with_retries()
 def zammad_post(path, data):
+    # Long timeouts: a ticket with hundreds of MB of attachments can take minutes
+    # to upload and store, and timing out here would retry and duplicate the ticket.
+    # urllib3 applies the *connect* timeout to each socket write while sending the
+    # body, so it must also cover stalls mid-upload (e.g. nginx buffering to disk).
     r = requests.post(f"{ZAMMAD_BASE_URL}/api/v1{path}",
-                      headers=zammad_headers(), json=data, timeout=30)
+                      headers=zammad_headers(), json=data, timeout=(300, 600))
     r.raise_for_status()
     return r.json()
 
