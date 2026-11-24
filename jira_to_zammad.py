@@ -61,10 +61,20 @@ STATUS_MAP = {
     "Open":        "open",
     "In Progress": "open",
     "Waiting":     "pending reminder",
+    "Waiting for support":  "open",
+    "Waiting for customer": "open",
+    "Pending":     "open",
+    "2:nd Line":   "open",
     "Resolved":    "closed",
     "Closed":      "closed",
     "Done":        "closed",
+    "Canceled":    "closed",
+    "Cancelled":   "closed",
 }
+
+# Jira statuses that mean "cancelled": migrated as closed, but tagged so they
+# stay distinguishable from solved tickets (Zammad has no cancelled state).
+CANCELED_STATUSES = {"Canceled", "Cancelled"}
 
 # Optional: map Jira priority names → Zammad priority names
 # Zammad defaults: "1 low", "2 normal", "3 high"
@@ -205,7 +215,7 @@ def fetch_all_jira_issues():
             "jql": f"project={JIRA_PROJECT_KEY} ORDER BY created ASC",
             "startAt": start,
             "maxResults": batch,
-            "fields": "summary,description,status,priority,assignee,reporter,comment,attachment,created,updated"
+            "fields": "summary,description,status,priority,assignee,reporter,comment,attachment,created,updated,resolution"
         })
         issues.extend(data["issues"])
         logger.info(f"  Fetched {len(issues)}/{data['total']} issues...")
@@ -403,8 +413,26 @@ def assign_users_to_organisations():
 
     logger.info(f"Done: {assigned} assigned, {skipped} skipped, {failed} errors")
 
-def map_status(jira_status_name):
-    return STATUS_MAP.get(jira_status_name, "open")
+def map_status(jira_status):
+    """Map a Jira status object to a Zammad state. Unmapped statuses fall back
+    on Jira's status category: "Done" → closed, anything else → open."""
+    name = jira_status["name"]
+    if name in STATUS_MAP:
+        return STATUS_MAP[name]
+    category = (jira_status.get("statusCategory") or {}).get("key")
+    state = "closed" if category == "done" else "open"
+    logger.warning(f"    unmapped Jira status '{name}' (category: {category}) → '{state}'; add it to STATUS_MAP")
+    return state
+
+def jira_tags(fields):
+    """Zammad tags recording a cancelled Jira issue and its resolution."""
+    if fields["status"]["name"] not in CANCELED_STATUSES:
+        return []
+    tags = ["jira-canceled"]
+    resolution = (fields.get("resolution") or {}).get("name")
+    if resolution:
+        tags.append(resolution.lower())
+    return tags
 
 def map_priority(jira_priority_name):
     return PRIORITY_MAP.get(jira_priority_name or "Medium", "2 normal")
@@ -468,7 +496,7 @@ def migrate_issue(issue):
     # --- Ticket payload ---
     ticket_payload = {
         "title":       fields.get("summary", "(no title)"),
-        "state":       map_status(fields["status"]["name"]),
+        "state":       map_status(fields["status"]),
         "priority":    map_priority((fields.get("priority") or {}).get("name")),
         "group":       ZAMMAD_GROUP,
         "article":     article,
@@ -479,6 +507,9 @@ def migrate_issue(issue):
         ticket_payload["owner_id"] = owner_id
     if created_at:
         ticket_payload["created_at"] = created_at
+    tags = jira_tags(fields)
+    if tags:
+        ticket_payload["tags"] = ",".join(tags)
 
     # Create the ticket
     if DRY_RUN:
