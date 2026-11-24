@@ -81,6 +81,9 @@ Other flags:
 
 - `--resume-from KEY` — skip issues before this Jira key (in created-ascending order)
 - `--project-key KEY` — override `JIRA_PROJECT_KEY` for this run
+- `--sync` — also bring already-migrated tickets up to date (see below)
+- `--jira-wins KEYS` — with `--sync`, overwrite the Zammad state of these comma-separated
+  Jira keys from Jira even if the ticket was changed in Zammad more recently
 - `-v` / `--verbose` — debug-level logging
 
 ### Resuming after a failure or interruption
@@ -95,6 +98,28 @@ recreates every ticket).
 Issues that fail outright (not interrupted, but a real per-issue error) are **not** added
 to the state file, are logged to `migration_failed.txt` / `migration_failed_detail.txt`
 at the end of the run, and will be retried automatically on the next run.
+
+### Keeping Zammad in sync while Jira is still in use
+
+A normal run migrates each issue once and never revisits it. If people keep working in
+Jira after the migration, run with `--sync` to bring the migrated tickets up to date:
+
+```bash
+python3 jira_to_zammad.py --dry-run --sync   # see what would change
+python3 jira_to_zammad.py --sync
+```
+
+For every ticket in `migration_state.json`, `--sync`:
+
+- adds Jira comments missing in Zammad (matched by creation timestamp, so nothing is posted twice);
+- adds Jira attachments missing in Zammad (matched by filename) on one extra article;
+- updates the state when Jira changed more recently than the Zammad ticket. If the ticket was
+  changed in Zammad more recently, it is left alone and reported as a conflict; use
+  `--jira-wins KEY` to let Jira win anyway.
+
+New Jira issues are migrated as usual in the same run. Enable `import_mode` for sync runs too,
+so the added articles keep their Jira dates and no notifications are sent. Once the team has
+moved to Zammad, make the Jira project read-only and do one final `--sync`.
 
 ## Known limitations
 
