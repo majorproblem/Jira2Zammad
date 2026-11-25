@@ -6,6 +6,7 @@ Migrates: tickets (title + description), comments, attachments, assignees & repo
 
 import argparse
 import base64
+import contextlib
 import functools
 import itertools
 import json
@@ -14,6 +15,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -89,6 +91,10 @@ PRIORITY_MAP = {
 }
 
 STATE_FILE = Path("migration_state.json")
+
+# Zammad's import_mode setting: keeps the created_at we send and suppresses
+# notifications. Real runs switch it on for their duration.
+IMPORT_MODE_SETTING_ID = int(os.environ.get("ZAMMAD_IMPORT_MODE_SETTING_ID", "152"))
 
 DRY_RUN = False
 _dry_run_ticket_ids = itertools.count(1)
@@ -535,16 +541,20 @@ def fetch_comments(issue):
         comments = jira_get(f"/issue/{issue['key']}/comment", params={"maxResults": 1000})["comments"]
     return comments
 
+def comment_body(comment):
+    author_name = (comment.get("author") or {}).get("displayName", "Jira User")
+    body_text = extract_text(comment.get("body", {})).strip() or "(empty comment)"
+    return f"[{author_name}]:\n{body_text}"
+
 def add_comment(ticket_id, comment):
     author = comment.get("author") or {}
     author_email = author.get("emailAddress", "")
     author_name  = author.get("displayName", "Jira User")
-    body_text = extract_text(comment.get("body", {})).strip() or "(empty comment)"
 
     comment_article = {
         "ticket_id": ticket_id,
         "subject":   "Comment",
-        "body":      f"[{author_name}]:\n{body_text}",
+        "body":      comment_body(comment),
         "type":      "note",
         "internal":  False,
         "sender":    "Agent",
@@ -577,11 +587,15 @@ def parse_ts(value):
     """Jira ("...+0100") or Zammad ("...Z") timestamp → aware UTC datetime."""
     return datetime.strptime(value.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z").astimezone(timezone.utc)
 
+def normalize_ws(text):
+    return " ".join(text.split())
+
 def sync_issue(issue, ticket_id, jira_wins=False):
     """Add Jira comments and attachments missing from the Zammad ticket and update its state.
 
-    Comments are matched on their creation timestamp, which the migration
-    preserves. A state mismatch is resolved in Jira's favour only when Jira
+    A comment counts as present if an article has its creation timestamp
+    (preserved under import_mode) or its text (in case it was migrated without
+    import_mode, which stamps articles with the import time). A state mismatch is resolved in Jira's favour only when Jira
     changed after the Zammad ticket was last updated (or jira_wins is set);
     otherwise the ticket is left alone and reported as a conflict.
     Returns (comments_added, attachments_added, state_changed, conflict_message_or_None)."""
@@ -592,9 +606,17 @@ def sync_issue(issue, ticket_id, jira_wins=False):
     ticket_updated = parse_ts(ticket["updated_at"])
 
     articles = zammad_get(f"/ticket_articles/by_ticket/{ticket_id}")
-    have = {parse_ts(a["created_at"]).replace(microsecond=0) for a in articles}
-    missing = [c for c in fetch_comments(issue)
-               if c.get("created") and parse_ts(c["created"]).replace(microsecond=0) not in have]
+    have_times = {parse_ts(a["created_at"]).replace(microsecond=0) for a in articles}
+    have_texts = Counter(normalize_ws(a["body"]) for a in articles)
+    missing = []
+    for c in fetch_comments(issue):
+        text = normalize_ws(comment_body(c))
+        if c.get("created") and parse_ts(c["created"]).replace(microsecond=0) in have_times:
+            have_texts[text] -= 1
+        elif have_texts[text] > 0:
+            have_texts[text] -= 1   # each article accounts for one identical comment
+        else:
+            missing.append(c)
     for comment in missing:
         add_comment(ticket_id, comment)
     if missing:
@@ -648,6 +670,26 @@ def sync_issue(issue, ticket_id, jira_wins=False):
 # State (resume support)
 # ─────────────────────────────────────────────
 
+@contextlib.contextmanager
+def import_mode():
+    """Enable Zammad's import_mode for the duration of the block, restoring
+    the previous value afterwards (also on errors and Ctrl-C)."""
+    path = f"/settings/{IMPORT_MODE_SETTING_ID}"
+    setting = zammad_get(path)
+    if setting.get("name") != "import_mode":
+        raise RuntimeError(f"Zammad setting {IMPORT_MODE_SETTING_ID} is '{setting.get('name')}', not 'import_mode'; "
+                           "set ZAMMAD_IMPORT_MODE_SETTING_ID to the right id")
+    was_on = bool((setting.get("state_current") or {}).get("value"))
+    if not was_on:
+        zammad_put(path, {"state_current": {"value": True}})
+        logger.info("  Zammad import_mode enabled for this run")
+    try:
+        yield
+    finally:
+        if not was_on:
+            zammad_put(path, {"state_current": {"value": False}})
+            logger.info("  Zammad import_mode disabled again")
+
 def load_state():
     if STATE_FILE.exists():
         try:
@@ -674,11 +716,12 @@ def parse_args():
                               "Runs already resume automatically via %s; use this to skip further ahead." % STATE_FILE)
     parser.add_argument("--project-key", default=None,
                          help="Override JIRA_PROJECT_KEY from config.")
-    parser.add_argument("--sync", action="store_true",
-                         help="Also update already-migrated tickets: add Jira comments and attachments missing in Zammad and "
-                              "update the state when Jira changed more recently than the Zammad ticket.")
+    parser.add_argument("--no-sync", dest="sync", action="store_false",
+                         help="Only migrate new issues; skip already-migrated tickets. By default they are synced: "
+                              "Jira comments and attachments missing in Zammad are added, and the state is updated "
+                              "when Jira changed more recently than the Zammad ticket.")
     parser.add_argument("--jira-wins", metavar="KEYS", default="",
-                         help="Comma-separated Jira keys whose Zammad state is overwritten from Jira during --sync "
+                         help="Comma-separated Jira keys whose Zammad state is overwritten from Jira during sync "
                               "even if the ticket was changed in Zammad more recently.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args()
@@ -698,6 +741,13 @@ def main():
 
     validate_config()
 
+    if DRY_RUN:
+        run(args)
+    else:
+        with import_mode():
+            run(args)
+
+def run(args):
     logger.info(f"[1/3] Fetching issues from Jira project '{JIRA_PROJECT_KEY}'...")
     try:
         issues = fetch_all_jira_issues()

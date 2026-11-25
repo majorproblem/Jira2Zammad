@@ -50,11 +50,12 @@ Required environment variables (see `.env.example`):
 
 - The API token's user needs admin rights: creating/updating users, roles, groups,
   organizations, and tickets.
-- **To preserve original Jira timestamps**, enable Zammad's `import_mode` system setting
-  before running (`PUT /api/v1/settings/152` with `{"state_current": {"value": true}}`),
-  and disable it again afterward. Without this, Zammad overwrites `created_at` with the
-  actual import time regardless of what's sent in the payload. Import mode also suppresses
-  outgoing notifications during the run — another reason to turn it back off when done.
+- **Zammad's `import_mode` setting is switched on automatically** for the duration of every
+  real run and restored afterwards (also on errors or Ctrl-C). It preserves the original Jira
+  timestamps — without it Zammad stamps everything with the import time — and suppresses
+  notifications. The script expects it at setting id 152; if your instance differs, set
+  `ZAMMAD_IMPORT_MODE_SETTING_ID`. If a run is killed hard (e.g. `kill -9`), check that
+  `import_mode` was turned off again.
 - If ticket creation fails with `422 Invalid value for field 'owner_id'`, the Zammad user
   being set as owner needs both the **Agent** role and explicit group access
   (`group_ids`) to `ZAMMAD_GROUP` — the script handles this automatically via
@@ -81,8 +82,8 @@ Other flags:
 
 - `--resume-from KEY` — skip issues before this Jira key (in created-ascending order)
 - `--project-key KEY` — override `JIRA_PROJECT_KEY` for this run
-- `--sync` — also bring already-migrated tickets up to date (see below)
-- `--jira-wins KEYS` — with `--sync`, overwrite the Zammad state of these comma-separated
+- `--no-sync` — only migrate new issues, without syncing already-migrated tickets (see below)
+- `--jira-wins KEYS` — when syncing, overwrite the Zammad state of these comma-separated
   Jira keys from Jira even if the ticket was changed in Zammad more recently
 - `-v` / `--verbose` — debug-level logging
 
@@ -101,25 +102,27 @@ at the end of the run, and will be retried automatically on the next run.
 
 ### Keeping Zammad in sync while Jira is still in use
 
-A normal run migrates each issue once and never revisits it. If people keep working in
-Jira after the migration, run with `--sync` to bring the migrated tickets up to date:
+Every run also brings already-migrated tickets up to date, so changes people keep making
+in Jira after the migration reach Zammad:
 
 ```bash
-python3 jira_to_zammad.py --dry-run --sync   # see what would change
-python3 jira_to_zammad.py --sync
+python3 jira_to_zammad.py --dry-run   # see what would change
+python3 jira_to_zammad.py
 ```
 
-For every ticket in `migration_state.json`, `--sync`:
+For every ticket in `migration_state.json`, the run:
 
-- adds Jira comments missing in Zammad (matched by creation timestamp, so nothing is posted twice);
+- adds Jira comments missing in Zammad (matched by creation timestamp or text, so nothing is posted twice);
 - adds Jira attachments missing in Zammad (matched by filename) on one extra article;
 - updates the state when Jira changed more recently than the Zammad ticket. If the ticket was
   changed in Zammad more recently, it is left alone and reported as a conflict; use
   `--jira-wins KEY` to let Jira win anyway.
 
-New Jira issues are migrated as usual in the same run. Enable `import_mode` for sync runs too,
-so the added articles keep their Jira dates and no notifications are sent. Once the team has
-moved to Zammad, make the Jira project read-only and do one final `--sync`.
+New Jira issues are migrated as usual in the same run. Syncing checks every migrated ticket,
+which takes a couple of minutes for ~850 tickets; `--no-sync` skips it and only migrates new
+issues. Matching on text as well means tickets migrated without `import_mode` (whose articles
+carry the import time) don't get duplicate comments. Once the team has moved to Zammad, make
+the Jira project read-only and do one final run.
 
 ## Known limitations
 
