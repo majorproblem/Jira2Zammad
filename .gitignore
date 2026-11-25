@@ -5,7 +5,7 @@ __pycache__/
 CLAUDE.md
 
 # Run artifacts — contain real ticket/customer data
-migration_run.log
+migration_run*.log
 migration_failed.txt
 migration_failed_detail.txt
 migration_state.json

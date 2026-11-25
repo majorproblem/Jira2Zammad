@@ -6,6 +6,7 @@ Migrates: tickets (title + description), comments, attachments, assignees & repo
 
 import argparse
 import base64
+import contextlib
 import functools
 import itertools
 import json
@@ -13,6 +14,8 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -88,6 +91,10 @@ PRIORITY_MAP = {
 }
 
 STATE_FILE = Path("migration_state.json")
+
+# Zammad's import_mode setting: keeps the created_at we send and suppresses
+# notifications. Real runs switch it on for their duration.
+IMPORT_MODE_SETTING_ID = int(os.environ.get("ZAMMAD_IMPORT_MODE_SETTING_ID", "152"))
 
 DRY_RUN = False
 _dry_run_ticket_ids = itertools.count(1)
@@ -521,39 +528,167 @@ def migrate_issue(issue):
         logger.info(f"  Created Zammad ticket #{ticket_id} ← {jira_key}: {fields['summary'][:60]}")
 
     # --- Comments ---
-    comments = (fields.get("comment") or {}).get("comments", [])
-    for comment in comments:
-        author = comment.get("author") or {}
-        author_email = author.get("emailAddress", "")
-        author_name  = author.get("displayName", "Jira User")
-        body_text = extract_text(comment.get("body", {})).strip() or "(empty comment)"
-
-        comment_article = {
-            "ticket_id": ticket_id,
-            "subject":   "Comment",
-            "body":      f"[{author_name}]:\n{body_text}",
-            "type":      "note",
-            "internal":  False,
-            "sender":    "Agent",
-        }
-        author_id = find_or_create_zammad_user(author_email, author_name)
-        if author_id:
-            comment_article["created_by_id"] = author_id
-        if comment.get("created"):
-            comment_article["created_at"] = comment["created"]
-
-        if DRY_RUN:
-            logger.debug(f"    [dry-run] would add comment by {author_name}")
-        else:
-            zammad_post("/ticket_articles", comment_article)
-            logger.debug(f"    comment by {author_name}")
-            time.sleep(0.1)
+    for comment in fetch_comments(issue):
+        add_comment(ticket_id, comment)
 
     return ticket_id
+
+def fetch_comments(issue):
+    """All comments of an issue; the search API may truncate the embedded list."""
+    embedded = issue["fields"].get("comment") or {}
+    comments = embedded.get("comments", [])
+    if embedded.get("total", 0) > len(comments):
+        comments = jira_get(f"/issue/{issue['key']}/comment", params={"maxResults": 1000})["comments"]
+    return comments
+
+def comment_body(comment):
+    author_name = (comment.get("author") or {}).get("displayName", "Jira User")
+    body_text = extract_text(comment.get("body", {})).strip() or "(empty comment)"
+    return f"[{author_name}]:\n{body_text}"
+
+def add_comment(ticket_id, comment):
+    author = comment.get("author") or {}
+    author_email = author.get("emailAddress", "")
+    author_name  = author.get("displayName", "Jira User")
+
+    comment_article = {
+        "ticket_id": ticket_id,
+        "subject":   "Comment",
+        "body":      comment_body(comment),
+        "type":      "note",
+        "internal":  False,
+        "sender":    "Agent",
+    }
+    author_id = find_or_create_zammad_user(author_email, author_name)
+    if author_id:
+        comment_article["created_by_id"] = author_id
+    if comment.get("created"):
+        comment_article["created_at"] = comment["created"]
+
+    if DRY_RUN:
+        logger.debug(f"    [dry-run] would add comment by {author_name}")
+    else:
+        zammad_post("/ticket_articles", comment_article)
+        logger.debug(f"    comment by {author_name}")
+        time.sleep(0.1)
+
+# ─────────────────────────────────────────────
+# Sync (bring already-migrated tickets up to date)
+# ─────────────────────────────────────────────
+
+_zammad_state_names = {}
+
+def zammad_state_name(state_id):
+    if not _zammad_state_names:
+        _zammad_state_names.update({s["id"]: s["name"] for s in zammad_get("/ticket_states")})
+    return _zammad_state_names[state_id]
+
+def parse_ts(value):
+    """Jira ("...+0100") or Zammad ("...Z") timestamp → aware UTC datetime."""
+    return datetime.strptime(value.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z").astimezone(timezone.utc)
+
+def normalize_ws(text):
+    return " ".join(text.split())
+
+def sync_issue(issue, ticket_id, jira_wins=False):
+    """Add Jira comments and attachments missing from the Zammad ticket and update its state.
+
+    A comment counts as present if an article has its creation timestamp
+    (preserved under import_mode) or its text (in case it was migrated without
+    import_mode, which stamps articles with the import time). A state mismatch is resolved in Jira's favour only when Jira
+    changed after the Zammad ticket was last updated (or jira_wins is set);
+    otherwise the ticket is left alone and reported as a conflict.
+    Returns (comments_added, attachments_added, state_changed, conflict_message_or_None)."""
+    fields = issue["fields"]
+    ticket = zammad_get(f"/tickets/{ticket_id}")
+    current = zammad_state_name(ticket["state_id"])
+    target = map_status(fields["status"])
+    ticket_updated = parse_ts(ticket["updated_at"])
+
+    articles = zammad_get(f"/ticket_articles/by_ticket/{ticket_id}")
+    have_times = {parse_ts(a["created_at"]).replace(microsecond=0) for a in articles}
+    have_texts = Counter(normalize_ws(a["body"]) for a in articles)
+    missing = []
+    for c in fetch_comments(issue):
+        text = normalize_ws(comment_body(c))
+        if c.get("created") and parse_ts(c["created"]).replace(microsecond=0) in have_times:
+            have_texts[text] -= 1
+        elif have_texts[text] > 0:
+            have_texts[text] -= 1   # each article accounts for one identical comment
+        else:
+            missing.append(c)
+    for comment in missing:
+        add_comment(ticket_id, comment)
+    if missing:
+        logger.info(f"    {'[dry-run] would add' if DRY_RUN else 'added'} {len(missing)} comment(s)")
+
+    # Attachments added in Jira after migration go on one extra article,
+    # dated like the newest of them so the ticket timeline stays in order.
+    have_files = {att["filename"] for a in articles for att in a.get("attachments", [])}
+    late = [a for a in fields.get("attachment") or [] if a["filename"] not in have_files]
+    uploads = []
+    for att in late:
+        result = download_attachment(att)   # None if over MAX_ATTACHMENT_MB (already logged)
+        if result:
+            fname, b64data, mime = result
+            uploads.append({"filename": fname, "data": b64data, "mime-type": mime})
+    if uploads:
+        names = [u["filename"] for u in uploads]
+        article = {
+            "ticket_id":   ticket_id,
+            "subject":     "Attachments",
+            "body":        "[Attachments added in Jira]\n" + "\n".join(names),
+            "type":        "note",
+            "internal":    False,
+            "sender":      "Agent",
+            "attachments": uploads,
+            "created_at":  max((a["created"] for a in late), key=parse_ts),
+        }
+        if DRY_RUN:
+            logger.info(f"    [dry-run] would add {len(uploads)} attachment(s): {', '.join(names)}")
+        else:
+            zammad_post("/ticket_articles", article)
+            logger.info(f"    added {len(uploads)} attachment(s): {', '.join(names)}")
+
+    # State last: adding articles to a closed ticket could otherwise reopen it.
+    conflict, state_changed = None, False
+    if current != target:
+        if jira_wins or parse_ts(fields["updated"]) > ticket_updated:
+            state_changed = True
+            if DRY_RUN:
+                logger.info(f"    [dry-run] would change state {current} → {target}")
+            else:
+                zammad_put(f"/tickets/{ticket_id}", {"state": target})
+                logger.info(f"    state {current} → {target}")
+        else:
+            conflict = (f"Zammad '{current}' vs Jira '{fields['status']['name']}' → '{target}': "
+                        f"changed in Zammad after Jira; left as is (use --jira-wins {issue['key']})")
+
+    return len(missing), len(uploads), state_changed, conflict
 
 # ─────────────────────────────────────────────
 # State (resume support)
 # ─────────────────────────────────────────────
+
+@contextlib.contextmanager
+def import_mode():
+    """Enable Zammad's import_mode for the duration of the block, restoring
+    the previous value afterwards (also on errors and Ctrl-C)."""
+    path = f"/settings/{IMPORT_MODE_SETTING_ID}"
+    setting = zammad_get(path)
+    if setting.get("name") != "import_mode":
+        raise RuntimeError(f"Zammad setting {IMPORT_MODE_SETTING_ID} is '{setting.get('name')}', not 'import_mode'; "
+                           "set ZAMMAD_IMPORT_MODE_SETTING_ID to the right id")
+    was_on = bool((setting.get("state_current") or {}).get("value"))
+    if not was_on:
+        zammad_put(path, {"state_current": {"value": True}})
+        logger.info("  Zammad import_mode enabled for this run")
+    try:
+        yield
+    finally:
+        if not was_on:
+            zammad_put(path, {"state_current": {"value": False}})
+            logger.info("  Zammad import_mode disabled again")
 
 def load_state():
     if STATE_FILE.exists():
@@ -581,6 +716,13 @@ def parse_args():
                               "Runs already resume automatically via %s; use this to skip further ahead." % STATE_FILE)
     parser.add_argument("--project-key", default=None,
                          help="Override JIRA_PROJECT_KEY from config.")
+    parser.add_argument("--no-sync", dest="sync", action="store_false",
+                         help="Only migrate new issues; skip already-migrated tickets. By default they are synced: "
+                              "Jira comments and attachments missing in Zammad are added, and the state is updated "
+                              "when Jira changed more recently than the Zammad ticket.")
+    parser.add_argument("--jira-wins", metavar="KEYS", default="",
+                         help="Comma-separated Jira keys whose Zammad state is overwritten from Jira during sync "
+                              "even if the ticket was changed in Zammad more recently.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args()
 
@@ -599,6 +741,13 @@ def main():
 
     validate_config()
 
+    if DRY_RUN:
+        run(args)
+    else:
+        with import_mode():
+            run(args)
+
+def run(args):
     logger.info(f"[1/3] Fetching issues from Jira project '{JIRA_PROJECT_KEY}'...")
     try:
         issues = fetch_all_jira_issues()
@@ -616,9 +765,12 @@ def main():
         else:
             logger.warning(f"  --resume-from key {args.resume_from} not found among fetched issues; ignoring")
 
-    state = {} if DRY_RUN else load_state()
+    state = load_state()
     if state:
-        logger.info(f"  {len(state)} issues already migrated per {STATE_FILE}, will skip")
+        action = "will sync" if args.sync else "will skip"
+        logger.info(f"  {len(state)} issues already migrated per {STATE_FILE}, {action}")
+    jira_wins = {k.strip() for k in args.jira_wins.split(",") if k.strip()}
+    synced_comments, synced_files, synced_states, conflicts = 0, 0, 0, []
 
     if args.limit:
         pending = [iss for iss in issues if iss["key"] not in state][:args.limit]
@@ -630,8 +782,25 @@ def main():
     for i, issue in enumerate(issues, 1):
         key = issue["key"]
         if key in state:
-            logger.debug(f"[{i}/{len(issues)}] {key} — already migrated (ticket #{state[key]}), skipping")
-            success += 1
+            if not args.sync:
+                logger.debug(f"[{i}/{len(issues)}] {key} — already migrated (ticket #{state[key]}), skipping")
+                success += 1
+                continue
+            try:
+                added, files, changed, conflict = sync_issue(issue, state[key], jira_wins=key in jira_wins)
+                if added or files or changed or conflict:
+                    logger.info(f"[{i}/{len(issues)}] {key} → ticket #{state[key]} synced")
+                if conflict:
+                    logger.warning(f"    CONFLICT: {conflict}")
+                    conflicts.append((key, state[key], conflict))
+                synced_comments += added
+                synced_files += files
+                synced_states += changed
+                success += 1
+            except Exception as e:
+                detail = error_detail(e)
+                logger.error(f"  {key} sync FAILED: {detail}")
+                failed.append((key, detail))
             continue
         logger.info(f"[{i}/{len(issues)}] {key}")
         try:
@@ -648,6 +817,12 @@ def main():
 
     logger.info("[3/4] Done migrating.")
     logger.info(f"  Migrated: {success}/{len(issues)} tickets")
+    if args.sync:
+        verb = "would be " if DRY_RUN else ""
+        logger.info(f"  Sync: {synced_states} state change(s), {synced_comments} comment(s) and "
+                    f"{synced_files} attachment(s) {verb}applied")
+        for key, tid, msg in conflicts:
+            logger.info(f"  Conflict {key} (#{tid}): {msg}")
     if failed:
         logger.info(f"  Failed:   {len(failed)} tickets → {', '.join(k for k, _ in failed)}")
         Path("migration_failed.txt").write_text(
