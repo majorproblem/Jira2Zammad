@@ -815,7 +815,7 @@ def run(args):
             failed.append((key, detail))
         time.sleep(0.3)   # be gentle on both APIs
 
-    logger.info("[3/4] Done migrating.")
+    logger.info("  Done migrating.")
     logger.info(f"  Migrated: {success}/{len(issues)} tickets")
     if args.sync:
         verb = "would be " if DRY_RUN else ""
@@ -835,9 +835,9 @@ def run(args):
         logger.info("  Failure details written to migration_failed_detail.txt")
 
     if DRY_RUN:
-        logger.info("[4/4] Skipping organisation assignment ([DRY RUN]).")
+        logger.info("[3/3] Skipping organisation assignment ([DRY RUN]).")
     else:
-        logger.info("[4/4] Assigning users to organisations...")
+        logger.info("[3/3] Assigning users to organisations...")
         assign_users_to_organisations()
 
 if __name__ == "__main__":
